@@ -322,7 +322,7 @@ func TestMmapExpansionPutMany(t *testing.T) {
 	for i := 0; i < 1024; i++ {
 		b := make([]byte, 1024)
 		rand.Read(b)
-		c := cid.NewCidV1(cid.Raw, ipfsUtil.Hash(b)) // makes a copy of k
+		c := cid.NewCidV1(cid.Raw, ipfsUtil.Hash(b))
 		blk, err := blocks.NewBlockWithCid(b, c)
 		require.NoError(t, err)
 		blks = append(blks, blk)
@@ -337,7 +337,7 @@ func putEntries(t *testing.T, bs bstest.Blockstore, count int, size int) []block
 	for i := 0; i < count; i++ {
 		b := make([]byte, size)
 		rand.Read(b)
-		c := cid.NewCidV1(cid.Raw, ipfsUtil.Hash(b)) // makes a copy of k
+		c := cid.NewCidV1(cid.Raw, ipfsUtil.Hash(b))
 		blk, err := blocks.NewBlockWithCid(b, c)
 		require.NoError(t, err)
 		require.NoError(t, bs.Put(blk))

@@ -2,6 +2,7 @@ package lmdbbs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -75,7 +76,7 @@ type Blockstore struct {
 	// only uses a 1:1 mapping between envs and dbs.
 	env *lmdb.Env
 	// db is an object representing an LMDB database inside an env.
-	db lmdb.DBI
+	blockDB lmdb.DBI
 	// opts are the options for this blockstore.
 	opts *Options
 
@@ -92,14 +93,10 @@ func (b *Blockstore) HashOnRead(enabled bool) {
 	b.rehash.Store(enabled)
 }
 
-type WithLmdbEnv interface {
-	GetEnv() *lmdb.Env
-}
-
 var (
 	_ blockstore.Blockstore = (*Blockstore)(nil)
 	_ blockstore.Viewer     = (*Blockstore)(nil)
-	_ WithLmdbEnv           = (*Blockstore)(nil)
+	_ DataStorage           = (*Blockstore)(nil)
 )
 
 // Options for the Blockstore
@@ -150,6 +147,28 @@ type Options struct {
 	// MaxDBs is the maximum amount of open databases that will be open withing the LMDB environment
 	// Useful when environment is accessed directly to open databases directly within it
 	MaxDBs int
+
+	// CidToKeyMapper is a function which converts cid to a key in the LMDB
+	CidToKeyMapper func(cid.Cid) []byte
+
+	// CidToKeyMapper is a function which converts cid to a key in the LMDB
+	// 	Returns nil when key doesn't correspond to []byte
+	// 	Function must make a copy of input byte array
+	KeyToCidMapper func([]byte) cid.Cid
+}
+
+func (opts *Options) KeyToCid(key []byte) cid.Cid {
+	if opts.KeyToCidMapper == nil {
+		return cid.NewCidV1(cid.Raw, key) // makes a copy of k
+	}
+	return opts.KeyToCidMapper(key)
+}
+
+func (opts *Options) CidToKey(cid cid.Cid) []byte {
+	if opts.CidToKeyMapper == nil {
+		return cid.Hash()
+	}
+	return opts.CidToKeyMapper(cid)
 }
 
 // Open initiates lmdb environment, database and returns Blockstore
@@ -255,7 +274,7 @@ func Open(opts *Options) (*Blockstore, error) {
 		rehash:           uatomic.NewBool(false),
 	}
 	err = env.View(func(txn *lmdb.Txn) (err error) {
-		bs.db, err = txn.OpenRoot(lmdb.Create)
+		bs.blockDB, err = txn.OpenRoot(lmdb.Create)
 		return err
 	})
 	if err != nil {
@@ -266,26 +285,23 @@ func Open(opts *Options) (*Blockstore, error) {
 }
 
 // Close closes the blockstore
+// Note that DBs created with OpenDB should be closed before this function
 func (b *Blockstore) Close() error {
 	if !atomic.CompareAndSwapInt32(&b.closed, 0, 1) {
 		return nil
 	}
-	b.env.CloseDBI(b.db)
+	b.env.CloseDBI(b.blockDB)
 	return b.env.Close()
 }
 
-func (b *Blockstore) GetEnv() *lmdb.Env {
-	return b.env
-}
-
-func (b *Blockstore) getImpl(cid cid.Cid, handler func(val []byte) error) error {
+func (b *Blockstore) getImpl(db lmdb.DBI, key []byte, handler func(val []byte) error) error {
 	b.oplock.RLock()
 	defer b.oplock.RUnlock()
 
 	for {
 		err := b.env.View(func(txn *lmdb.Txn) error {
 			txn.RawRead = true
-			v, err := txn.Get(b.db, cid.Hash())
+			v, err := txn.Get(db, key)
 			if err == nil {
 				err = handler(v)
 			}
@@ -346,7 +362,7 @@ func (b *Blockstore) updateImpl(doUpdate func(txn *lmdb.Txn) error) error {
 
 // Has checks if the cid is present in the blockstore
 func (b *Blockstore) Has(cid cid.Cid) (bool, error) {
-	err := b.getImpl(cid, func(val []byte) error { return nil })
+	err := b.getImpl(b.blockDB, b.opts.CidToKey(cid), func(val []byte) error { return nil })
 	if lmdb.IsNotFound(err) {
 		return false, nil
 	}
@@ -359,7 +375,7 @@ func (b *Blockstore) Has(cid cid.Cid) (bool, error) {
 // if you want only to read some of the bytes of the block, use View
 func (b *Blockstore) Get(key cid.Cid) (blocks.Block, error) {
 	var res blocks.Block
-	err := b.getImpl(key, func(v []byte) (err error) {
+	err := b.getImpl(b.blockDB, b.opts.CidToKey(key), func(v []byte) (err error) {
 		if b.rehash.Load() {
 			var key2 cid.Cid
 			key2, err = key.Prefix().Sum(v)
@@ -389,7 +405,7 @@ func (b *Blockstore) Get(key cid.Cid) (blocks.Block, error) {
 // Note that it is not safe to access bytes passed to the callback
 // outside of the callback's call context.
 func (b *Blockstore) View(cid cid.Cid, callback func([]byte) error) error {
-	err := b.getImpl(cid, callback)
+	err := b.getImpl(b.blockDB, b.opts.CidToKey(cid), callback)
 	if lmdb.IsNotFound(err) || lmdb.IsErrno(err, lmdb.BadValSize) {
 		// lmdb returns badvalsize with nil keys.
 		return blockstore.ErrNotFound
@@ -401,7 +417,7 @@ func (b *Blockstore) View(cid cid.Cid, callback func([]byte) error) error {
 // When block is not found, blockstore.ErrNotFound is returned
 func (b *Blockstore) GetSize(cid cid.Cid) (int, error) {
 	size := -1
-	err := b.getImpl(cid, func(v []byte) error {
+	err := b.getImpl(b.blockDB, b.opts.CidToKey(cid), func(v []byte) error {
 		size = len(v)
 		return nil
 	})
@@ -417,7 +433,11 @@ func (b *Blockstore) GetSize(cid cid.Cid) (int, error) {
 // no overwrite will take place.
 func (b *Blockstore) Put(block blocks.Block) error {
 	return b.updateImpl(func(txn *lmdb.Txn) error {
-		err := txn.Put(b.db, block.Cid().Hash(), block.RawData(), lmdb.NoOverwrite)
+		key := b.opts.CidToKey(block.Cid())
+		if key == nil {
+			return errors.New("failed to map cid to key")
+		}
+		err := txn.Put(b.blockDB, key, block.RawData(), lmdb.NoOverwrite)
 		if err == nil || lmdb.IsErrno(err, lmdb.KeyExist) {
 			return nil
 		}
@@ -431,7 +451,11 @@ func (b *Blockstore) Put(block blocks.Block) error {
 func (b *Blockstore) PutMany(blocks []blocks.Block) error {
 	return b.updateImpl(func(txn *lmdb.Txn) error {
 		for _, block := range blocks {
-			err := txn.Put(b.db, block.Cid().Hash(), block.RawData(), lmdb.NoOverwrite)
+			key := b.opts.CidToKey(block.Cid())
+			if key == nil {
+				return errors.New("failed to map cid to key")
+			}
+			err := txn.Put(b.blockDB, key, block.RawData(), lmdb.NoOverwrite)
 			if err != nil && !lmdb.IsErrno(err, lmdb.KeyExist) {
 				return err // short-circuit
 			}
@@ -444,7 +468,11 @@ func (b *Blockstore) PutMany(blocks []blocks.Block) error {
 // This is a no-op for cid that is absent in the Blockstore.
 func (b *Blockstore) DeleteBlock(cid cid.Cid) error {
 	return b.updateImpl(func(txn *lmdb.Txn) error {
-		err := txn.Del(b.db, cid.Hash(), nil)
+		key := b.opts.CidToKey(cid)
+		if key == nil {
+			return errors.New("failed to map cid to key")
+		}
+		err := txn.Del(b.blockDB, key, nil)
 		if err == nil || lmdb.IsNotFound(err) {
 			return nil
 		}
@@ -457,7 +485,11 @@ func (b *Blockstore) DeleteBlock(cid cid.Cid) error {
 func (b *Blockstore) DeleteMany(cids []cid.Cid) error {
 	return b.updateImpl(func(txn *lmdb.Txn) error {
 		for _, c := range cids {
-			err := txn.Del(b.db, c.Hash(), nil)
+			key := b.opts.CidToKey(c)
+			if key == nil {
+				return errors.New("failed to map cid to key")
+			}
+			err := txn.Del(b.blockDB, key, nil)
 			if err != nil && !lmdb.IsNotFound(err) {
 				return err
 			}
@@ -486,6 +518,8 @@ type cursor struct {
 
 // run runs this cursor
 func (c *cursor) run() {
+	opts := c.blockstore.opts
+
 	if c.interrupt.IsClosed() {
 		return
 	}
@@ -494,14 +528,20 @@ func (c *cursor) run() {
 		var notifyClosed chan struct{}
 		err := c.blockstore.env.View(func(txn *lmdb.Txn) error {
 			txn.RawRead = true
-			cur, err := txn.OpenCursor(c.blockstore.db)
+			cur, err := txn.OpenCursor(c.blockstore.blockDB)
 			if err != nil {
 				return err
 			}
 			defer cur.Close()
 
 			if c.last.Defined() {
-				_, _, err := cur.Get(c.last.Hash(), nil, lmdb.Set)
+				key := opts.CidToKey(c.last)
+				var err error
+				if key == nil {
+					err = errors.New("failed to map cid to key")
+				} else {
+					_, _, err = cur.Get(key, nil, lmdb.Set)
+				}
 				if err != nil {
 					return fmt.Errorf("failed to position cursor: %w", err)
 				}
@@ -521,7 +561,11 @@ func (c *cursor) run() {
 					return err
 				}
 
-				it := cid.NewCidV1(cid.Raw, k) // makes a copy of k
+				it := opts.KeyToCid(k) // makes a copy of k
+				if !it.Defined() {
+					// ignoring key
+					continue
+				}
 				select {
 				case c.out <- it:
 				case notifyClosed = <-c.interrupt.InterruptChan():
@@ -657,4 +701,69 @@ func roundup(value, multiple int64) int64 {
 // Stat returns lmdb statistics
 func (b *Blockstore) Stat() (*lmdb.Stat, error) {
 	return b.env.Stat()
+}
+
+type DataStorage interface {
+	OpenDB(name string) (lmdb.DBI, error)
+	GetData(db lmdb.DBI, key []byte) ([]byte, error)
+	PutData(db lmdb.DBI, key []byte, valueF func(prevVal []byte, exists bool) (newVal []byte, newExists bool, err error)) error
+	CloseDB(lmdb.DBI)
+}
+
+// OpenDB opens a database in the same environment as the block storage
+func (b *Blockstore) OpenDB(name string) (lmdb.DBI, error) {
+	var db lmdb.DBI
+	err := b.env.View(func(txn *lmdb.Txn) (err error) {
+		db, err = txn.OpenDBI(name, lmdb.Create)
+		return
+	})
+	return db, err
+}
+
+func (b *Blockstore) CloseDB(db lmdb.DBI) {
+	b.env.CloseDBI(db)
+}
+
+// GetData retrieves arbitrary key-value pair from the blockstore
+// 	This is useful to store some meta data in the storage
+func (b *Blockstore) GetData(db lmdb.DBI, key []byte) ([]byte, error) {
+	var res []byte
+	err := b.getImpl(db, key, func(v []byte) (err error) {
+		res = make([]byte, len(v))
+		copy(res, v)
+		return
+	})
+
+	if lmdb.IsNotFound(err) || lmdb.IsErrno(err, lmdb.BadValSize) {
+		// lmdb returns badvalsize with nil keys.
+		return nil, blockstore.ErrNotFound
+	}
+	return res, err
+}
+
+// PutData saves arbitrary key-value pair in the blockstore
+// 	This is useful to store some meta data in the storage
+//  Any existing value will be overwritten
+func (b *Blockstore) PutData(db lmdb.DBI, key []byte, valueF func(prevVal []byte, exists bool) (newVal []byte, newExists bool, err error)) error {
+	return b.updateImpl(func(txn *lmdb.Txn) error {
+		var err error
+		prev, err := txn.Get(db, key)
+		exists := !lmdb.IsNotFound(err)
+		if exists && err != nil {
+			return err
+		}
+		v, retain, err := valueF(prev, exists)
+		if err != nil {
+			return err
+		}
+		if retain {
+			return txn.Put(db, key, v, 0)
+		} else {
+			err = txn.Del(db, key, nil)
+			if lmdb.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+	})
 }
