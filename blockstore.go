@@ -92,9 +92,14 @@ func (b *Blockstore) HashOnRead(enabled bool) {
 	b.rehash.Store(enabled)
 }
 
+type WithLmdbEnv interface {
+	GetEnv() *lmdb.Env
+}
+
 var (
 	_ blockstore.Blockstore = (*Blockstore)(nil)
 	_ blockstore.Viewer     = (*Blockstore)(nil)
+	_ WithLmdbEnv           = (*Blockstore)(nil)
 )
 
 // Options for the Blockstore
@@ -141,6 +146,10 @@ type Options struct {
 	//   are using old transactions while a writer is active. The simplest approach is to use an exclusive lock so that
 	//   no readers may be active at all when a writer begins.
 	NoLock bool
+
+	// MaxDBs is the maximum amount of open databases that will be open withing the LMDB environment
+	// Useful when environment is accessed directly to open databases directly within it
+	MaxDBs int
 }
 
 // Open initiates lmdb environment, database and returns Blockstore
@@ -198,6 +207,11 @@ func Open(opts *Options) (*Blockstore, error) {
 	}
 	if err = env.SetMapSize(opts.InitialMmapSize); err != nil {
 		return nil, fmt.Errorf("failed to set LMDB map size: %w", err)
+	}
+	if opts.MaxDBs > 0 {
+		if err = env.SetMaxDBs(opts.MaxDBs); err != nil {
+			return nil, fmt.Errorf("failed to set LMDB max dbs: %w", err)
+		}
 	}
 	// Use the default max readers (254) unless a value is passed in the options.
 	if opts.MaxReaders == 0 {
@@ -258,6 +272,10 @@ func (b *Blockstore) Close() error {
 	}
 	b.env.CloseDBI(b.db)
 	return b.env.Close()
+}
+
+func (b *Blockstore) GetEnv() *lmdb.Env {
+	return b.env
 }
 
 func (b *Blockstore) getImpl(cid cid.Cid, handler func(val []byte) error) error {
