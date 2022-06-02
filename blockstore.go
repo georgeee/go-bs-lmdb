@@ -173,16 +173,16 @@ func (opts *Options) CidToKey(cid cid.Cid) []byte {
 
 // Open initiates lmdb environment, database and returns Blockstore
 func Open(opts *Options) (*Blockstore, error) {
-	path := opts.Path
-	switch st, err := os.Stat(path); {
+	path_ := opts.Path
+	switch st, err := os.Stat(path_); {
 	case os.IsNotExist(err):
-		if err := os.MkdirAll(path, 0777); err != nil {
-			return nil, fmt.Errorf("failed to create lmdb data directory at %s: %w", path, err)
+		if err := os.MkdirAll(path_, 0777); err != nil {
+			return nil, fmt.Errorf("failed to create lmdb data directory at %s: %w", path_, err)
 		}
 	case err != nil:
 		return nil, fmt.Errorf("failed to check if lmdb data dir exists: %w", err)
 	case !st.IsDir():
-		return nil, fmt.Errorf("lmdb path is not a directory %s", path)
+		return nil, fmt.Errorf("lmdb path is not a directory %s", path_)
 	}
 
 	pagesize := os.Getpagesize()
@@ -227,10 +227,12 @@ func Open(opts *Options) (*Blockstore, error) {
 	if err = env.SetMapSize(opts.InitialMmapSize); err != nil {
 		return nil, fmt.Errorf("failed to set LMDB map size: %w", err)
 	}
+	maxDbs := 1
 	if opts.MaxDBs > 0 {
-		if err = env.SetMaxDBs(opts.MaxDBs); err != nil {
-			return nil, fmt.Errorf("failed to set LMDB max dbs: %w", err)
-		}
+		maxDbs = opts.MaxDBs
+	}
+	if err = env.SetMaxDBs(maxDbs); err != nil {
+		return nil, fmt.Errorf("failed to set LMDB max dbs: %w", err)
 	}
 	// Use the default max readers (254) unless a value is passed in the options.
 	if opts.MaxReaders == 0 {
@@ -259,7 +261,7 @@ func Open(opts *Options) (*Blockstore, error) {
 	if opts.NoSync {
 		flags |= lmdb.MapAsync
 	}
-	err = env.Open(path, flags, 0777)
+	err = env.Open(path_, flags, 0777)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open lmdb database: %w", err)
 	}
@@ -711,13 +713,17 @@ type DataStorage interface {
 }
 
 // OpenDB opens a database in the same environment as the block storage
-func (b *Blockstore) OpenDB(name string) (lmdb.DBI, error) {
-	var db lmdb.DBI
-	err := b.env.View(func(txn *lmdb.Txn) (err error) {
+func (b *Blockstore) OpenDB(name string) (db lmdb.DBI, err error) {
+	f := func(txn *lmdb.Txn) (err error) {
 		db, err = txn.OpenDBI(name, lmdb.Create)
-		return
-	})
-	return db, err
+		return err
+	}
+	if b.opts.ReadOnly {
+		err = b.env.View(f)
+	} else {
+		err = b.env.Update(f)
+	}
+	return
 }
 
 func (b *Blockstore) CloseDB(db lmdb.DBI) {

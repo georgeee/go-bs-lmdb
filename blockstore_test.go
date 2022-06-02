@@ -226,7 +226,7 @@ func TestMmapExpansionWithCursors(t *testing.T) {
 
 func TestGrowUnderConcurrency(t *testing.T) {
 	opts := Options{ // set a really aggressive policy that makes the mmap grow very frequently.
-		InitialMmapSize:      1 << 10,
+		InitialMmapSize:      1 << 20,
 		MmapGrowthStepFactor: 1.5,
 		MmapGrowthStepMax:    2 << 10,
 	}
@@ -310,7 +310,7 @@ func TestRetryWhenReadersFull(t *testing.T) {
 // encounters a MDB_MAP_FULL error, and that it retries once the grow finishes.
 func TestMmapExpansionPutMany(t *testing.T) {
 	opts := Options{
-		InitialMmapSize:      1 << 10,
+		InitialMmapSize:      1 << 20,
 		MmapGrowthStepFactor: 1.5,
 		MmapGrowthStepMax:    2 << 10,
 	}
@@ -359,7 +359,7 @@ type deleteManyer interface {
 
 func TestDeleteMany(t *testing.T) {
 	opts := Options{
-		InitialMmapSize:      1 << 10,
+		InitialMmapSize:      1 << 20,
 		MmapGrowthStepFactor: 1.5,
 		MmapGrowthStepMax:    2 << 10,
 	}
