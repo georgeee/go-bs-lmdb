@@ -1,4 +1,4 @@
-module github.com/georgeee/go-bs-lmdb
+module github.com/o1-labs/go-bs-lmdb
 
 go 1.15
 
