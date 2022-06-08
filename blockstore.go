@@ -14,6 +14,7 @@ import (
 	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	blockstore "github.com/ipfs/go-ipfs-blockstore"
+	ipld "github.com/ipfs/go-ipld-format"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/ledgerwatch/lmdb-go/lmdb"
 	uatomic "go.uber.org/atomic"
@@ -296,11 +297,11 @@ func (b *Blockstore) Close() error {
 	return b.env.Close()
 }
 
-func (b *Blockstore) getImpl(db lmdb.DBI, key []byte, handler func(val []byte) error) error {
+func (b *Blockstore) getImpl(ctx context.Context, db lmdb.DBI, key []byte, handler func(val []byte) error) error {
 	b.oplock.RLock()
 	defer b.oplock.RUnlock()
 
-	for {
+	for ctx.Err() == nil {
 		err := b.env.View(func(txn *lmdb.Txn) error {
 			txn.RawRead = true
 			v, err := txn.Get(db, key)
@@ -322,6 +323,7 @@ func (b *Blockstore) getImpl(db lmdb.DBI, key []byte, handler func(val []byte) e
 			return err
 		}
 	}
+	return ctx.Err()
 }
 
 func wrapGrowError(err error) error {
@@ -340,10 +342,10 @@ func (b *Blockstore) growGuarded() error {
 	return wrapGrowError(err)
 }
 
-func (b *Blockstore) updateImpl(doUpdate func(txn *lmdb.Txn) error) error {
+func (b *Blockstore) updateImpl(ctx context.Context, doUpdate func(txn *lmdb.Txn) error) error {
 	b.oplock.RLock()
 	defer b.oplock.RUnlock()
-	for {
+	for ctx.Err() == nil {
 		err := b.env.Update(doUpdate)
 		switch {
 		case err == nil: // shortcircuit happy path.
@@ -360,11 +362,12 @@ func (b *Blockstore) updateImpl(doUpdate func(txn *lmdb.Txn) error) error {
 			return err
 		}
 	}
+	return ctx.Err()
 }
 
 // Has checks if the cid is present in the blockstore
-func (b *Blockstore) Has(cid cid.Cid) (bool, error) {
-	err := b.getImpl(b.blockDB, b.opts.CidToKey(cid), func(val []byte) error { return nil })
+func (b *Blockstore) Has(ctx context.Context, cid cid.Cid) (bool, error) {
+	err := b.getImpl(ctx, b.blockDB, b.opts.CidToKey(cid), func(val []byte) error { return nil })
 	if lmdb.IsNotFound(err) {
 		return false, nil
 	}
@@ -372,12 +375,12 @@ func (b *Blockstore) Has(cid cid.Cid) (bool, error) {
 }
 
 // Get retrieves a block with the given cid
-// When block is not found, blockstore.ErrNotFound is returned
+// When block is not found, ipld.ErrNotFound is returned
 // Please note that bytes of the whole block are copied,
 // if you want only to read some of the bytes of the block, use View
-func (b *Blockstore) Get(key cid.Cid) (blocks.Block, error) {
+func (b *Blockstore) Get(ctx context.Context, key cid.Cid) (blocks.Block, error) {
 	var res blocks.Block
-	err := b.getImpl(b.blockDB, b.opts.CidToKey(key), func(v []byte) (err error) {
+	err := b.getImpl(ctx, b.blockDB, b.opts.CidToKey(key), func(v []byte) (err error) {
 		if b.rehash.Load() {
 			var key2 cid.Cid
 			key2, err = key.Prefix().Sum(v)
@@ -396,36 +399,36 @@ func (b *Blockstore) Get(key cid.Cid) (blocks.Block, error) {
 
 	if lmdb.IsNotFound(err) || lmdb.IsErrno(err, lmdb.BadValSize) {
 		// lmdb returns badvalsize with nil keys.
-		return nil, blockstore.ErrNotFound
+		return nil, ipld.ErrNotFound{Cid: key}
 	}
 	return res, err
 }
 
 // View retrieves bytes of a block with the given cid and
 // calls the callback on it.
-// When block is not found, blockstore.ErrNotFound is returned
+// When block is not found, ipld.ErrNotFound is returned
 // Note that it is not safe to access bytes passed to the callback
 // outside of the callback's call context.
-func (b *Blockstore) View(cid cid.Cid, callback func([]byte) error) error {
-	err := b.getImpl(b.blockDB, b.opts.CidToKey(cid), callback)
+func (b *Blockstore) View(ctx context.Context, key cid.Cid, callback func([]byte) error) error {
+	err := b.getImpl(ctx, b.blockDB, b.opts.CidToKey(key), callback)
 	if lmdb.IsNotFound(err) || lmdb.IsErrno(err, lmdb.BadValSize) {
 		// lmdb returns badvalsize with nil keys.
-		return blockstore.ErrNotFound
+		return ipld.ErrNotFound{Cid: key}
 	}
 	return err
 }
 
 // GetSize returns size of the block.
-// When block is not found, blockstore.ErrNotFound is returned
-func (b *Blockstore) GetSize(cid cid.Cid) (int, error) {
+// When block is not found, ipld.ErrNotFound is returned
+func (b *Blockstore) GetSize(ctx context.Context, key cid.Cid) (int, error) {
 	size := -1
-	err := b.getImpl(b.blockDB, b.opts.CidToKey(cid), func(v []byte) error {
+	err := b.getImpl(ctx, b.blockDB, b.opts.CidToKey(key), func(v []byte) error {
 		size = len(v)
 		return nil
 	})
 	if lmdb.IsNotFound(err) || lmdb.IsErrno(err, lmdb.BadValSize) {
 		// lmdb returns badvalsize with nil keys.
-		err = blockstore.ErrNotFound
+		err = ipld.ErrNotFound{Cid: key}
 	}
 	return size, err
 }
@@ -433,8 +436,8 @@ func (b *Blockstore) GetSize(cid cid.Cid) (int, error) {
 // Put adds the block to the blockstore
 // This is a no-op when block is already present in the Blockstore,
 // no overwrite will take place.
-func (b *Blockstore) Put(block blocks.Block) error {
-	return b.updateImpl(func(txn *lmdb.Txn) error {
+func (b *Blockstore) Put(ctx context.Context, block blocks.Block) error {
+	return b.updateImpl(ctx, func(txn *lmdb.Txn) error {
 		key := b.opts.CidToKey(block.Cid())
 		if key == nil {
 			return errors.New("failed to map cid to key")
@@ -450,8 +453,8 @@ func (b *Blockstore) Put(block blocks.Block) error {
 // PutMany adds the blocks to the blockstore
 // This is a no-op for blocks that are already present in the Blockstore,
 // no overwrites will take place.
-func (b *Blockstore) PutMany(blocks []blocks.Block) error {
-	return b.updateImpl(func(txn *lmdb.Txn) error {
+func (b *Blockstore) PutMany(ctx context.Context, blocks []blocks.Block) error {
+	return b.updateImpl(ctx, func(txn *lmdb.Txn) error {
 		for _, block := range blocks {
 			key := b.opts.CidToKey(block.Cid())
 			if key == nil {
@@ -468,8 +471,8 @@ func (b *Blockstore) PutMany(blocks []blocks.Block) error {
 
 // DeleteBlock removes the block from the blockstore, given its cid.
 // This is a no-op for cid that is absent in the Blockstore.
-func (b *Blockstore) DeleteBlock(cid cid.Cid) error {
-	return b.updateImpl(func(txn *lmdb.Txn) error {
+func (b *Blockstore) DeleteBlock(ctx context.Context, cid cid.Cid) error {
+	return b.updateImpl(ctx, func(txn *lmdb.Txn) error {
 		key := b.opts.CidToKey(cid)
 		if key == nil {
 			return errors.New("failed to map cid to key")
@@ -484,8 +487,8 @@ func (b *Blockstore) DeleteBlock(cid cid.Cid) error {
 
 // DeleteMany removes blocks from the blockstore with the given cids.
 // This is a no-op for cids that are absent in the Blockstore.
-func (b *Blockstore) DeleteMany(cids []cid.Cid) error {
-	return b.updateImpl(func(txn *lmdb.Txn) error {
+func (b *Blockstore) DeleteMany(ctx context.Context, cids []cid.Cid) error {
+	return b.updateImpl(ctx, func(txn *lmdb.Txn) error {
 		for _, c := range cids {
 			key := b.opts.CidToKey(c)
 			if key == nil {
@@ -707,8 +710,8 @@ func (b *Blockstore) Stat() (*lmdb.Stat, error) {
 
 type DataStorage interface {
 	OpenDB(name string) (lmdb.DBI, error)
-	GetData(db lmdb.DBI, key []byte) ([]byte, error)
-	PutData(db lmdb.DBI, key []byte, valueF func(prevVal []byte, exists bool) (newVal []byte, newExists bool, err error)) error
+	GetData(ctx context.Context, db lmdb.DBI, key []byte) ([]byte, error)
+	PutData(ctx context.Context, db lmdb.DBI, key []byte, valueF func(prevVal []byte, exists bool) (newVal []byte, newExists bool, err error)) error
 	CloseDB(lmdb.DBI)
 }
 
@@ -732,9 +735,9 @@ func (b *Blockstore) CloseDB(db lmdb.DBI) {
 
 // GetData retrieves arbitrary key-value pair from the blockstore
 // 	This is useful to store some meta data in the storage
-func (b *Blockstore) GetData(db lmdb.DBI, key []byte) ([]byte, error) {
+func (b *Blockstore) GetData(ctx context.Context, db lmdb.DBI, key []byte) ([]byte, error) {
 	var res []byte
-	err := b.getImpl(db, key, func(v []byte) (err error) {
+	err := b.getImpl(ctx, db, key, func(v []byte) (err error) {
 		res = make([]byte, len(v))
 		copy(res, v)
 		return
@@ -742,7 +745,7 @@ func (b *Blockstore) GetData(db lmdb.DBI, key []byte) ([]byte, error) {
 
 	if lmdb.IsNotFound(err) || lmdb.IsErrno(err, lmdb.BadValSize) {
 		// lmdb returns badvalsize with nil keys.
-		return nil, blockstore.ErrNotFound
+		return nil, ipld.ErrNotFound{}
 	}
 	return res, err
 }
@@ -750,8 +753,8 @@ func (b *Blockstore) GetData(db lmdb.DBI, key []byte) ([]byte, error) {
 // PutData saves arbitrary key-value pair in the blockstore
 // 	This is useful to store some meta data in the storage
 //  Any existing value will be overwritten
-func (b *Blockstore) PutData(db lmdb.DBI, key []byte, valueF func(prevVal []byte, exists bool) (newVal []byte, newExists bool, err error)) error {
-	return b.updateImpl(func(txn *lmdb.Txn) error {
+func (b *Blockstore) PutData(ctx context.Context, db lmdb.DBI, key []byte, valueF func(prevVal []byte, exists bool) (newVal []byte, newExists bool, err error)) error {
+	return b.updateImpl(ctx, func(txn *lmdb.Txn) error {
 		var err error
 		prev, err := txn.Get(db, key)
 		exists := !lmdb.IsNotFound(err)

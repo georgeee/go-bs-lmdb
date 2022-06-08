@@ -16,9 +16,10 @@ import (
 	"github.com/ipfs/go-cid"
 	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	ipfsUtil "github.com/ipfs/go-ipfs-util"
+	ipld "github.com/ipfs/go-ipld-format"
 	logger "github.com/ipfs/go-log/v2"
 	"github.com/multiformats/go-multihash"
-	bstest "github.com/raulk/go-bs-tests"
+	bstest "github.com/o1-labs/go-bs-tests"
 	"github.com/stretchr/testify/require"
 )
 
@@ -74,7 +75,7 @@ func openBlockstore(opts Options) func(tb testing.TB, path string) (bstest.Block
 
 func checkBlocksBs(t *testing.T, bs blockstore.Viewer, blocks []blocks.Block) {
 	for _, b := range blocks {
-		require.NoError(t, bs.View(b.Cid(), func(data []byte) error {
+		require.NoError(t, bs.View(context.Background(), b.Cid(), func(data []byte) error {
 			if !bytes.Equal(data, b.RawData()) {
 				return fmt.Errorf("unexpected value for a key")
 			}
@@ -248,7 +249,7 @@ func TestGrowUnderConcurrency(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 1024; i++ {
-				_, _ = bs.Get(randomCID())
+				_, _ = bs.Get(context.Background(), randomCID())
 			}
 		}()
 	}
@@ -258,7 +259,7 @@ func TestGrowUnderConcurrency(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 1024; i++ {
-				_ = bs.DeleteBlock(randomCID())
+				_ = bs.DeleteBlock(context.Background(), randomCID())
 			}
 		}()
 	}
@@ -301,8 +302,9 @@ func TestRetryWhenReadersFull(t *testing.T) {
 
 	// this get will block until the cursor has finished.
 	start := time.Now()
-	_, err = bs.Get(randomCID())
-	require.Equal(t, blockstore.ErrNotFound, err)
+	randomK := randomCID()
+	_, err = bs.Get(context.Background(), randomK)
+	require.Equal(t, ipld.ErrNotFound{Cid: randomK}, err)
 	require.GreaterOrEqual(t, time.Since(start).Nanoseconds(), 1*time.Second.Nanoseconds())
 }
 
@@ -328,7 +330,7 @@ func TestMmapExpansionPutMany(t *testing.T) {
 		blks = append(blks, blk)
 	}
 
-	err := bs.PutMany(blks)
+	err := bs.PutMany(context.Background(), blks)
 	require.NoError(t, err)
 }
 
@@ -340,7 +342,7 @@ func putEntries(t *testing.T, bs bstest.Blockstore, count int, size int) []block
 		c := cid.NewCidV1(cid.Raw, ipfsUtil.Hash(b))
 		blk, err := blocks.NewBlockWithCid(b, c)
 		require.NoError(t, err)
-		require.NoError(t, bs.Put(blk))
+		require.NoError(t, bs.Put(context.Background(), blk))
 		res = append(res, blk)
 	}
 	return res
@@ -354,7 +356,7 @@ func randomCID() cid.Cid {
 }
 
 type deleteManyer interface {
-	DeleteMany([]cid.Cid) error
+	DeleteMany(context.Context, []cid.Cid) error
 }
 
 func TestDeleteMany(t *testing.T) {
@@ -373,12 +375,12 @@ func TestDeleteMany(t *testing.T) {
 		todelete[i] = blocks[i].Cid()
 	}
 
-	require.NoError(t, bs.DeleteBlock(todelete[5]))
-	require.NoError(t, bs.DeleteBlock(todelete[5]))
+	require.NoError(t, bs.DeleteBlock(context.Background(), todelete[5]))
+	require.NoError(t, bs.DeleteBlock(context.Background(), todelete[5]))
 
 	dm := bs.(deleteManyer)
 
-	if err := dm.DeleteMany(todelete); err != nil {
+	if err := dm.DeleteMany(context.Background(), todelete); err != nil {
 		t.Fatal(err)
 	}
 
