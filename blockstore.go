@@ -297,19 +297,12 @@ func (b *Blockstore) Close() error {
 	return b.env.Close()
 }
 
-func (b *Blockstore) getImpl(ctx context.Context, db lmdb.DBI, key []byte, handler func(val []byte) error) error {
+func (b *Blockstore) readOnlyOp(ctx context.Context, fn lmdb.TxnOp) error {
 	b.oplock.RLock()
 	defer b.oplock.RUnlock()
 
 	for ctx.Err() == nil {
-		err := b.env.View(func(txn *lmdb.Txn) error {
-			txn.RawRead = true
-			v, err := txn.Get(db, key)
-			if err == nil {
-				err = handler(v)
-			}
-			return err
-		})
+		err := b.env.View(fn)
 		switch {
 		case lmdb.IsErrno(err, lmdb.ReadersFull):
 			b.oplock.RUnlock() // yield.
@@ -324,6 +317,18 @@ func (b *Blockstore) getImpl(ctx context.Context, db lmdb.DBI, key []byte, handl
 		}
 	}
 	return ctx.Err()
+}
+
+func (b *Blockstore) getImpl(ctx context.Context, db lmdb.DBI, key []byte, handler func(val []byte) error) error {
+	return b.readOnlyOp(ctx,
+		func(txn *lmdb.Txn) error {
+			txn.RawRead = true
+			v, err := txn.Get(db, key)
+			if err == nil {
+				err = handler(v)
+			}
+			return err
+		})
 }
 
 func wrapGrowError(err error) error {
@@ -482,24 +487,6 @@ func (b *Blockstore) DeleteBlock(ctx context.Context, cid cid.Cid) error {
 			return nil
 		}
 		return err
-	})
-}
-
-// DeleteMany removes blocks from the blockstore with the given cids.
-// This is a no-op for cids that are absent in the Blockstore.
-func (b *Blockstore) DeleteMany(ctx context.Context, cids []cid.Cid) error {
-	return b.updateImpl(ctx, func(txn *lmdb.Txn) error {
-		for _, c := range cids {
-			key := b.opts.CidToKey(c)
-			if key == nil {
-				return errors.New("failed to map cid to key")
-			}
-			err := txn.Del(b.blockDB, key, nil)
-			if err != nil && !lmdb.IsNotFound(err) {
-				return err
-			}
-		}
-		return nil
 	})
 }
 
@@ -774,5 +761,26 @@ func (b *Blockstore) PutData(ctx context.Context, db lmdb.DBI, key []byte, value
 			}
 			return err
 		}
+	})
+}
+
+// DeleteMany removes blocks from the blockstore with the given cids.
+// This is a no-op for cids that are absent in the Blockstore.
+func (b *Blockstore) DeleteBlocksIf(ctx context.Context, keys [][]byte, predicate func(txn *lmdb.Txn, key []byte) (bool, error)) error {
+	return b.updateImpl(ctx, func(txn *lmdb.Txn) error {
+		for _, key := range keys {
+			needDelete, err := predicate(txn, key)
+			if err != nil {
+				return err
+			}
+			if !needDelete {
+				continue
+			}
+			err = txn.Del(b.blockDB, key, nil)
+			if err != nil && !lmdb.IsNotFound(err) {
+				return err
+			}
+		}
+		return nil
 	})
 }
